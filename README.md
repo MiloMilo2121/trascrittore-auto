@@ -70,7 +70,7 @@ Pacchetti usati:
 
 ## Note operative
 
-- `FILE_STABILITY_INTERVAL_SECONDS` e `FILE_STABILITY_REQUIRED_CHECKS` controllano quanto lo script aspetta prima di considerare chiuso il file scritto da OBS.
+- `FILE_STABILITY_INTERVAL_SECONDS`, `FILE_STABILITY_REQUIRED_CHECKS` e `FILE_QUIET_SECONDS` controllano quanto lo script aspetta prima di considerare chiuso il file scritto da OBS.
 - `DELETE_AUDIO_AFTER_PROCESSING=false` sposta l'audio in `ARCHIVE_DIR`.
 - `DELETE_AUDIO_AFTER_PROCESSING=true` elimina l'audio dopo aver salvato la trascrizione.
 - `ASSEMBLYAI_SPEAKERS_EXPECTED=2` puo migliorare la diarizzazione se le call hanno sempre due speaker. Lascialo vuoto se non sei certo.

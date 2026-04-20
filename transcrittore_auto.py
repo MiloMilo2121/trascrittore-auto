@@ -41,6 +41,7 @@ class AppConfig:
     poll_interval_seconds: float
     file_stability_interval_seconds: float
     file_stability_required_checks: int
+    file_quiet_seconds: float
     processing_timeout_seconds: int
     language_detection: bool
     speech_models: Tuple[str, ...]
@@ -135,6 +136,7 @@ def load_config() -> AppConfig:
         poll_interval_seconds=env_float("POLL_INTERVAL_SECONDS", 5.0),
         file_stability_interval_seconds=env_float("FILE_STABILITY_INTERVAL_SECONDS", 2.0),
         file_stability_required_checks=env_int("FILE_STABILITY_REQUIRED_CHECKS", 3),
+        file_quiet_seconds=env_float("FILE_QUIET_SECONDS", 120.0),
         processing_timeout_seconds=env_int("PROCESSING_TIMEOUT_SECONDS", 10800),
         language_detection=env_bool("ASSEMBLYAI_LANGUAGE_DETECTION", True),
         speech_models=speech_models,
@@ -159,9 +161,11 @@ def wait_for_file_complete(path: Path, config: AppConfig) -> None:
         if time.monotonic() - started_at > config.processing_timeout_seconds:
             raise TimeoutError(f"Timed out waiting for file to become stable: {path}")
 
+        quiet_for = 0.0
         try:
             stat = path.stat()
             signature = (stat.st_size, stat.st_mtime_ns)
+            quiet_for = time.time() - stat.st_mtime
             if stat.st_size <= 0:
                 stable_checks = 0
             elif signature == last_signature:
@@ -178,7 +182,10 @@ def wait_for_file_complete(path: Path, config: AppConfig) -> None:
         except OSError:
             stable_checks = 0
 
-        if stable_checks >= config.file_stability_required_checks:
+        if (
+            stable_checks >= config.file_stability_required_checks
+            and quiet_for >= config.file_quiet_seconds
+        ):
             logging.info("File is stable: %s", path.name)
             return
 
