@@ -220,7 +220,7 @@ def request_assemblyai_transcript(audio_url: str, config: AppConfig) -> str:
         "language_detection": config.language_detection,
     }
     if config.speech_models:
-        payload["speech_models"] = list(config.speech_models)
+        payload["speech_model"] = config.speech_models[0]
     if config.speakers_expected is not None:
         payload["speakers_expected"] = config.speakers_expected
 
