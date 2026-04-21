@@ -1570,8 +1570,13 @@ def remove_unreliable_followup_paragraphs(body: str, facts: Dict[str, Any]) -> s
         "incontro fissato",
         "incontro di aggiornamento",
         "ci sentiremo",
+        "ci risentiamo",
+        "verso l'estate",
         "confermo il nostro incontro",
         "confermo il prossimo",
+        "uno dei soci",
+        "realta esclusiva",
+        "realtà esclusiva",
     )
     kept = []
     for paragraph in paragraphs:
