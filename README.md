@@ -91,6 +91,7 @@ Quando saranno disponibili OAuth e ID del foglio, abilita Google Calendar e Goog
 ```bash
 GOOGLE_OAUTH_CLIENT_SECRETS=./google_oauth_client_secret.json
 GOOGLE_OAUTH_TOKEN=./google_oauth_token.json
+GOOGLE_OAUTH_LOCAL_PORT=8080
 GOOGLE_CALENDAR_ENABLED=true
 GOOGLE_CALENDAR_ID=primary
 GOOGLE_SHEETS_ENABLED=true
@@ -98,7 +99,7 @@ GOOGLE_SHEET_ID=...
 GOOGLE_SHEET_RANGE=FollowUp!A:Z
 ```
 
-Il primo avvio OAuth va fatto manualmente da terminale con `--draft-email-from-transcript`, cosi puo aprire il browser e salvare il token locale in `google_oauth_token.json`. Dopo il token, il LaunchAgent puo usare Calendar e Sheets in automatico.
+Il primo avvio OAuth va fatto manualmente da terminale con `--draft-email-from-transcript`, cosi puo aprire il browser e salvare il token locale in `google_oauth_token.json`. Se Google mostra `redirect_uri_mismatch`, nella console Google Cloud dell'OAuth client aggiungi l'URI di redirect autorizzato `http://localhost:8080/` oppure cambia `GOOGLE_OAUTH_LOCAL_PORT` e autorizza lo stesso URI con quella porta. Dopo il token, il LaunchAgent puo usare Calendar e Sheets in automatico.
 
 Per generare una bozza da una trascrizione gia esistente:
 

@@ -195,6 +195,7 @@ class AppConfig:
     google_calendar_next_meeting_days: int
     google_oauth_client_secrets_path: Optional[Path]
     google_oauth_token_path: Path
+    google_oauth_local_port: int
     google_sheets_enabled: bool
     google_sheet_id: str
     google_sheet_range: str
@@ -324,6 +325,7 @@ def load_config() -> AppConfig:
             "GOOGLE_OAUTH_CLIENT_SECRETS", "./google_oauth_client_secret.json"
         ),
         google_oauth_token_path=env_path("GOOGLE_OAUTH_TOKEN", "./google_oauth_token.json"),
+        google_oauth_local_port=env_int("GOOGLE_OAUTH_LOCAL_PORT", 8080),
         google_sheets_enabled=env_bool("GOOGLE_SHEETS_ENABLED", False),
         google_sheet_id=env_str("GOOGLE_SHEET_ID", ""),
         google_sheet_range=env_str("GOOGLE_SHEET_RANGE", "FollowUp!A:Z") or "FollowUp!A:Z",
@@ -723,6 +725,8 @@ def get_google_credentials(config: AppConfig, scopes: Sequence[str]) -> Any:
     creds = None
     if config.google_oauth_token_path.exists():
         creds = Credentials.from_authorized_user_file(str(config.google_oauth_token_path), list(scopes))
+        if creds and hasattr(creds, "has_scopes") and not creds.has_scopes(list(scopes)):
+            creds = None
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
@@ -734,7 +738,7 @@ def get_google_credentials(config: AppConfig, scopes: Sequence[str]) -> Any:
             str(config.google_oauth_client_secrets_path),
             list(scopes),
         )
-        creds = flow.run_local_server(port=0)
+        creds = flow.run_local_server(port=config.google_oauth_local_port)
 
     config.google_oauth_token_path.write_text(creds.to_json(), encoding="utf-8")
     return creds
