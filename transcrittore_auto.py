@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import os
@@ -10,9 +11,11 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Queue
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import quote_plus, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -28,71 +31,144 @@ TITLE_SYSTEM_PROMPT = (
     "principale di cui si parla. Rispondi SOLO con un nome file nel formato: "
     "Nome_Cognome_Prodotto. Nessun'altra parola."
 )
-EMAIL_SYSTEM_PROMPT = """
-Sei un assistente commerciale senior di Axend Group. Devi scrivere bozze email
-post-call pronte da inviare a prospect B2B italiani, usando la trascrizione della
-chiamata e, quando presente, il contesto dell'evento Calendar.
+FACT_EXTRACTION_SYSTEM_PROMPT = """
+Sei un analista commerciale di Axend Group. Ricevi dati Calendar, trascrizione,
+dati lead eventualmente gia noti e ricerca web. Devi estrarre e normalizzare i
+dati prima che venga scritta la mail.
 
-Obiettivo:
-- produrre una email naturale, precisa e professionale;
-- recuperare tutte le informazioni utili dalla call;
-- usare gli esempi forniti solo come riferimento di struttura, tono e livello di
-  dettaglio, non come fonte di fatti sul cliente corrente.
+Ordine di priorita delle fonti:
+1. Google Calendar
+2. Trascrizione call
+3. Dati gia forniti
+4. Sito ufficiale azienda
+5. Fonte esterna per P.IVA
 
-Regole di contenuto:
-- Non inventare mai dati mancanti. Se un dato serve ma non e disponibile, inseriscilo
-  in missing_fields e usa un placeholder chiaro nel corpo solo se indispensabile.
-- Usa il registro emerso nella chiamata. Se non e chiaro, usa il lei.
-- Mantieni prezzi, date, importi, prossimi step e richieste del cliente quando sono
-  presenti nella trascrizione o nel Calendar.
-- La partita IVA va inclusa se disponibile da Calendar o trascrizione. Se manca,
-  segnala "Partita IVA" in missing_fields.
-- Non promettere allegati se non risultano dalla call o dal Calendar. Se il cliente
-  li ha chiesti, cita cosa andra allegato.
-- Evita frasi generiche da brochure. La mail deve sembrare scritta dopo aver
-  ascoltato davvero quella call.
-- Non inserire citazioni, note, parentesi tipo [fonte] o riferimenti alle fonti
-  dentro il corpo della email.
-- Nel crm_payload, email, telefono, partita IVA e data follow-up completa devono
-  essere valorizzati solo se compaiono esplicitamente nelle fonti. Se non compaiono,
-  usa null e segnala il campo in missing_fields.
-- Se la call menziona solo giorno e mese del follow-up, senza anno, lascia
-  follow_up_date a null e riporta il testo nei next_steps.
+Regole:
+- Non inventare mai dati mancanti.
+- Se un dato manca, usa "Non reperito".
+- Se un dato e incerto o in conflitto, usa "Da verificare".
+- Email, telefono, P.IVA e date complete devono essere valorizzati solo se
+  compaiono nelle fonti o nella ricerca web verificata.
+- Se la call cita solo giorno e mese di un follow-up senza anno, metti
+  next_meeting_text con la formula testuale e next_meeting_date a "Da verificare".
+- Non aggiungere servizi non emersi. I servizi tipici sono "Analisi Basic",
+  "Analisi Sales Map", "Telesetting Advanced", ma usali solo se coerenti con
+  call e Calendar.
 
-Struttura consigliata del corpo email:
-1. saluto e recap del motivo della mail;
-2. "Analisi della situazione attuale" con contesto azienda, target, criticita,
-   obiettivi e canali gia usati;
-3. "Servizi proposti" con cosa consigliamo in base alla call;
-4. "Come funzionerebbe l'attivita" con spiegazione operativa dei servizi;
-5. "Investimento indicativo" se sono stati discussi prezzi o preventivo;
-6. "Conclusione e prossimi passi" con follow-up, call successiva, allegati o azioni.
-
-Output obbligatorio:
-Rispondi solo con un JSON valido, senza markdown e senza testo esterno, con queste
+Rispondi solo con JSON valido, senza markdown e senza testo esterno, con queste
 chiavi:
 {
-  "subject": "oggetto email",
-  "body": "corpo email pronto da inviare",
-  "source_notes": ["note sintetiche sulle fonti usate, solo alla fine della bozza"],
-  "missing_fields": ["campi utili mancanti"],
-  "crm_payload": {
-    "company_name": null,
-    "contact_name": null,
-    "vat_number": null,
-    "email": null,
-    "phone": null,
-    "current_situation": null,
-    "pain_points": [],
-    "goals": [],
-    "services_proposed": [],
-    "prices_discussed": [],
-    "next_steps": [],
-    "follow_up_date": null,
-    "decision_makers": [],
-    "confidence": "low|medium|high"
-  }
+  "company_name": "Non reperito",
+  "seller_name": "Non reperito",
+  "contact_name": "Non reperito",
+  "contact_first_name": "Non reperito",
+  "phone": "Non reperito",
+  "email": "Non reperito",
+  "vat_number": "Non reperito",
+  "vat_source": "Non reperito",
+  "proposed_services": [],
+  "close_confidence": "Non reperito",
+  "close_date": "Non reperito",
+  "next_meeting_date": "Non reperito",
+  "next_meeting_text": "Non reperito",
+  "needs": [],
+  "current_issues": [],
+  "goals": [],
+  "current_situation": "Non reperito",
+  "decision_makers": [],
+  "attachments_to_send": [],
+  "missing_or_to_verify": []
 }
+""".strip()
+
+EMAIL_SYSTEM_PROMPT = """
+Sei un'AI che scrive email di follow-up post discovery call.
+
+Scrivi SEMPRE come se fossi Francesca, collega del commerciale che ha svolto la
+call. Il tono deve essere cordiale ma estremamente professionale. Dare sempre
+del "Lei". Nessuna battuta. Nessun link nel corpo del testo.
+
+Ricevi:
+1. dati evento Google Calendar
+2. trascrizione della call
+3. eventuali dati gia noti del lead
+4. eventuale ricerca web o fonte esterna per verifica P.IVA
+5. dati estratti e normalizzati nella fase precedente
+
+Ordine di priorita delle fonti:
+1. Google Calendar
+2. Trascrizione call
+3. Dati gia forniti
+4. Sito ufficiale azienda
+5. Fonte esterna per P.IVA
+
+Regole fondamentali:
+- Non inventare mai dati mancanti.
+- Se un dato manca, scrivi "Non reperito".
+- Se un dato e incerto o in conflitto, scrivi "Da verificare".
+- Non aggiungere servizi non emersi.
+- Non inserire link nel corpo della mail.
+- Se serve citare la fonte della P.IVA, fallo solo in fondo, in una riga separata.
+- Usa sempre il "Lei" e le forme "Vostro/Vostra/Vostri" quando ti riferisci
+  all'azienda del prospect.
+- Fai sempre riferimento alla call con il commerciale corretto.
+- Scrivi la mail come testo pronto per essere inviato da Francesca.
+
+La mail deve avere questa logica:
+1. Saluto e ringraziamento per la call, con richiamo concreto alla loro realta.
+2. Analisi della Situazione Attuale: riassumi il contesto e spiega perche il
+   modello attuale e fragile, inefficiente, poco prevedibile o non scalabile.
+3. Obiettivi: chiarisci cosa vogliono ottenere.
+4. Percorso Operativo:
+   - Analisi: spiega output e utilita nel loro caso specifico.
+   - Telesetting: spiega come funziona e perche aiuta a raggiungere l'obiettivo.
+5. Conclusione: indica che in allegato c'e la proposta economica solo come
+   riferimento scritto, per evitare dubbi e facilitare il confronto interno.
+6. Se esiste un incontro gia fissato, confermalo. Specifica che sara presente
+   uno dei soci, perche siamo una realta esclusiva che collabora con un solo
+   partner per settore e teniamo a conoscere personalmente la proprieta prima
+   di partire.
+
+Usa questo formato di output ESATTO:
+
+{{nome azienda}}
+
+Venditore: {{venditore}}
+
+Riferimento: {{persona con cui si e parlato}}
+
+Tel: {{telefono}}
+
+Mail: {{email referente}}
+
+Partita IVA: {{piva}}
+
+Servizi proposti:
+* {{servizio 1}}
+* {{servizio 2}}
+
+Confidenza di chiusura: {{x%}}
+Data di chiusura: {{data}}
+
+______________
+
+Note in mail:
+
+{{testo completo della mail}}
+
+Regole finali:
+- La primissima riga della risposta deve essere il nome azienda, non iniziare mai
+  direttamente con "Gentile".
+- Dentro "Note in mail" usa sempre i titoli "Analisi della Situazione Attuale",
+  "Obiettivi", "Percorso Operativo" e "Conclusione".
+- Inizia la mail con "Gentile {{Nome}},"
+- Chiudi sempre con:
+
+Un cordiale saluto,
+
+Francesca
+
+- Restituisci solo l'output finale, senza spiegazioni extra.
 """.strip()
 
 
@@ -105,6 +181,23 @@ class AppConfig:
     email_drafts_dir: Path
     email_examples_dir: Optional[Path]
     calendar_context_dir: Optional[Path]
+    known_data_dir: Optional[Path]
+    default_seller_name: str
+    sender_name: str
+    sender_phone: str
+    vat_research_enabled: bool
+    vat_search_fallback_enabled: bool
+    vat_research_timeout_seconds: float
+    google_calendar_enabled: bool
+    google_calendar_id: str
+    google_calendar_lookup_before_minutes: int
+    google_calendar_lookup_after_minutes: int
+    google_calendar_next_meeting_days: int
+    google_oauth_client_secrets_path: Optional[Path]
+    google_oauth_token_path: Path
+    google_sheets_enabled: bool
+    google_sheet_id: str
+    google_sheet_range: str
     delete_audio_after_processing: bool
     assemblyai_api_key: str
     openai_api_key: str
@@ -181,6 +274,10 @@ def env_optional_path(name: str, default: str) -> Optional[Path]:
     return Path(value).expanduser().resolve()
 
 
+def env_str(name: str, default: str) -> str:
+    return os.getenv(name, default).strip()
+
+
 def load_config() -> AppConfig:
     load_dotenv()
 
@@ -211,6 +308,25 @@ def load_config() -> AppConfig:
         email_drafts_dir=env_path("EMAIL_DRAFTS_DIR", "./BozzeEmail"),
         email_examples_dir=env_optional_path("EMAIL_EXAMPLES_DIR", "./EsempiEmail"),
         calendar_context_dir=env_optional_path("CALENDAR_CONTEXT_DIR", "./EventiCalendar"),
+        known_data_dir=env_optional_path("KNOWN_DATA_DIR", "./DatiLead"),
+        default_seller_name=env_str("DEFAULT_SELLER_NAME", "Marco") or "Marco",
+        sender_name=env_str("SENDER_NAME", "Francesca") or "Francesca",
+        sender_phone=env_str("SENDER_PHONE", ""),
+        vat_research_enabled=env_bool("VAT_RESEARCH_ENABLED", True),
+        vat_search_fallback_enabled=env_bool("VAT_SEARCH_FALLBACK_ENABLED", False),
+        vat_research_timeout_seconds=env_float("VAT_RESEARCH_TIMEOUT_SECONDS", 8.0),
+        google_calendar_enabled=env_bool("GOOGLE_CALENDAR_ENABLED", False),
+        google_calendar_id=env_str("GOOGLE_CALENDAR_ID", "primary") or "primary",
+        google_calendar_lookup_before_minutes=env_int("GOOGLE_CALENDAR_LOOKUP_BEFORE_MINUTES", 120),
+        google_calendar_lookup_after_minutes=env_int("GOOGLE_CALENDAR_LOOKUP_AFTER_MINUTES", 30),
+        google_calendar_next_meeting_days=env_int("GOOGLE_CALENDAR_NEXT_MEETING_DAYS", 45),
+        google_oauth_client_secrets_path=env_optional_path(
+            "GOOGLE_OAUTH_CLIENT_SECRETS", "./google_oauth_client_secret.json"
+        ),
+        google_oauth_token_path=env_path("GOOGLE_OAUTH_TOKEN", "./google_oauth_token.json"),
+        google_sheets_enabled=env_bool("GOOGLE_SHEETS_ENABLED", False),
+        google_sheet_id=env_str("GOOGLE_SHEET_ID", ""),
+        google_sheet_range=env_str("GOOGLE_SHEET_RANGE", "FollowUp!A:Z") or "FollowUp!A:Z",
         delete_audio_after_processing=env_bool("DELETE_AUDIO_AFTER_PROCESSING", False),
         assemblyai_api_key=assemblyai_api_key,
         openai_api_key=openai_api_key,
@@ -241,6 +357,8 @@ def ensure_directories(config: AppConfig) -> None:
             config.email_examples_dir.mkdir(parents=True, exist_ok=True)
         if config.calendar_context_dir is not None:
             config.calendar_context_dir.mkdir(parents=True, exist_ok=True)
+        if config.known_data_dir is not None:
+            config.known_data_dir.mkdir(parents=True, exist_ok=True)
     if config.archive_dir is not None and not config.delete_audio_after_processing:
         config.archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -542,6 +660,248 @@ def find_calendar_context(
     return None, ""
 
 
+def find_known_data_context(
+    config: AppConfig,
+    lookup_stems: Sequence[str],
+) -> Tuple[Optional[Path], str]:
+    if config.known_data_dir is None or not config.known_data_dir.exists():
+        return None, ""
+
+    candidates: List[str] = []
+    for stem in lookup_stems:
+        clean_stem = stem.strip()
+        if not clean_stem:
+            continue
+        candidates.append(clean_stem)
+        candidates.append(sanitize_filename(clean_stem))
+
+    seen: Set[str] = set()
+    for stem in candidates:
+        if stem in seen:
+            continue
+        seen.add(stem)
+        for suffix in (".txt", ".md", ".json"):
+            path = config.known_data_dir / f"{stem}{suffix}"
+            if path.exists() and path.is_file():
+                return path, read_text(path, config.email_max_calendar_chars)
+
+    return None, ""
+
+
+def parse_reference_time_from_stem(stem: str) -> Optional[datetime]:
+    for pattern in ("%Y-%m-%d %H-%M-%S", "%Y-%m-%d_%H-%M-%S", "%Y%m%d_%H%M%S"):
+        try:
+            parsed = datetime.strptime(stem, pattern)
+            return parsed.astimezone()
+        except ValueError:
+            continue
+    return None
+
+
+def get_reference_time(audio_path: Optional[Path], transcript_path: Path) -> datetime:
+    if audio_path is not None:
+        parsed = parse_reference_time_from_stem(audio_path.stem)
+        if parsed is not None:
+            return parsed
+        if audio_path.exists():
+            return datetime.fromtimestamp(audio_path.stat().st_mtime).astimezone()
+    return datetime.fromtimestamp(transcript_path.stat().st_mtime).astimezone()
+
+
+def format_rfc3339(value: datetime) -> str:
+    return value.astimezone().isoformat()
+
+
+def get_google_credentials(config: AppConfig, scopes: Sequence[str]) -> Any:
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError as exc:
+        raise ConfigError("Install Google dependencies with pip install -r requirements.txt") from exc
+
+    creds = None
+    if config.google_oauth_token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(config.google_oauth_token_path), list(scopes))
+
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+
+    if not creds or not creds.valid:
+        if config.google_oauth_client_secrets_path is None or not config.google_oauth_client_secrets_path.exists():
+            raise ConfigError("Missing GOOGLE_OAUTH_CLIENT_SECRETS for Google OAuth")
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(config.google_oauth_client_secrets_path),
+            list(scopes),
+        )
+        creds = flow.run_local_server(port=0)
+
+    config.google_oauth_token_path.write_text(creds.to_json(), encoding="utf-8")
+    return creds
+
+
+def build_google_service(config: AppConfig, service_name: str, version: str, scopes: Sequence[str]) -> Any:
+    try:
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise ConfigError("Install Google dependencies with pip install -r requirements.txt") from exc
+
+    credentials = get_google_credentials(config, scopes)
+    return build(service_name, version, credentials=credentials)
+
+
+def event_datetime(value: Dict[str, str]) -> Optional[datetime]:
+    raw_value = value.get("dateTime") or value.get("date")
+    if not raw_value:
+        return None
+    if raw_value.endswith("Z"):
+        raw_value = raw_value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw_value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed
+
+
+def event_attendees(event: Dict[str, Any]) -> List[str]:
+    attendees = []
+    for attendee in event.get("attendees", []) or []:
+        email = str(attendee.get("email") or "").strip()
+        name = str(attendee.get("displayName") or "").strip()
+        if email and name:
+            attendees.append(f"{name} <{email}>")
+        elif email:
+            attendees.append(email)
+        elif name:
+            attendees.append(name)
+    return attendees
+
+
+def format_calendar_event(event: Dict[str, Any], prefix: str = "Evento") -> str:
+    start = event_datetime(event.get("start", {}) or {})
+    end = event_datetime(event.get("end", {}) or {})
+    organizer = event.get("organizer", {}) or {}
+    lines = [
+        f"{prefix}: {event.get('summary') or 'Senza titolo'}",
+        f"Inizio: {start.isoformat() if start else 'Non reperito'}",
+        f"Fine: {end.isoformat() if end else 'Non reperito'}",
+        f"Organizzatore: {organizer.get('displayName') or organizer.get('email') or 'Non reperito'}",
+        f"Partecipanti: {', '.join(event_attendees(event)) or 'Non reperito'}",
+    ]
+    description = str(event.get("description") or "").strip()
+    location = str(event.get("location") or "").strip()
+    if location:
+        lines.append(f"Luogo: {location}")
+    if description:
+        lines.extend(["Descrizione:", description])
+    return "\n".join(lines)
+
+
+def choose_best_calendar_event(events: Sequence[Dict[str, Any]], reference_time: datetime) -> Optional[Dict[str, Any]]:
+    best_event = None
+    best_distance = float("inf")
+    reference_time = reference_time.astimezone()
+    for event in events:
+        start = event_datetime(event.get("start", {}) or {})
+        end = event_datetime(event.get("end", {}) or {})
+        if start and end and start <= reference_time <= end:
+            return event
+        candidate_time = end or start
+        if candidate_time is None:
+            continue
+        distance = abs((candidate_time - reference_time).total_seconds())
+        if distance < best_distance:
+            best_distance = distance
+            best_event = event
+    return best_event
+
+
+def attendee_email_set(event: Dict[str, Any]) -> Set[str]:
+    emails = set()
+    for attendee in event.get("attendees", []) or []:
+        email = str(attendee.get("email") or "").strip().lower()
+        if email:
+            emails.add(email)
+    return emails
+
+
+def fetch_google_calendar_context(config: AppConfig, reference_time: datetime) -> str:
+    if not config.google_calendar_enabled:
+        return ""
+
+    service = build_google_service(
+        config,
+        "calendar",
+        "v3",
+        ["https://www.googleapis.com/auth/calendar.readonly"],
+    )
+    time_min = reference_time - timedelta(minutes=config.google_calendar_lookup_before_minutes)
+    time_max = reference_time + timedelta(minutes=config.google_calendar_lookup_after_minutes)
+    response = (
+        service.events()
+        .list(
+            calendarId=config.google_calendar_id,
+            timeMin=format_rfc3339(time_min),
+            timeMax=format_rfc3339(time_max),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=10,
+        )
+        .execute()
+    )
+    events = response.get("items", []) or []
+    matched_event = choose_best_calendar_event(events, reference_time)
+    if matched_event is None:
+        return "Nessun evento Google Calendar trovato nella finestra configurata."
+
+    parts = [format_calendar_event(matched_event, "Evento Google Calendar collegato")]
+    attendee_emails = attendee_email_set(matched_event)
+    if attendee_emails:
+        future_time_max = reference_time + timedelta(days=config.google_calendar_next_meeting_days)
+        future_response = (
+            service.events()
+            .list(
+                calendarId=config.google_calendar_id,
+                timeMin=format_rfc3339(reference_time + timedelta(minutes=1)),
+                timeMax=format_rfc3339(future_time_max),
+                singleEvents=True,
+                orderBy="startTime",
+                maxResults=20,
+            )
+            .execute()
+        )
+        future_events = []
+        for event in future_response.get("items", []) or []:
+            if attendee_emails.intersection(attendee_email_set(event)):
+                future_events.append(event)
+        if future_events:
+            parts.append(format_calendar_event(future_events[0], "Possibile prossimo incontro gia fissato"))
+
+    return "\n\n".join(parts)
+
+
+def build_calendar_context(
+    config: AppConfig,
+    lookup_stems: Sequence[str],
+    reference_time: datetime,
+) -> Tuple[Optional[Path], str]:
+    local_path, local_context = find_calendar_context(config, lookup_stems)
+    google_context = ""
+    try:
+        google_context = fetch_google_calendar_context(config, reference_time)
+    except Exception:
+        logging.exception("Failed to fetch Google Calendar context")
+
+    chunks = []
+    if google_context:
+        chunks.append("[GOOGLE_CALENDAR]\n" + google_context)
+    if local_context:
+        chunks.append(f"[LOCAL_CALENDAR_FILE: {local_path.name if local_path else 'unknown'}]\n{local_context}")
+    return local_path, "\n\n".join(chunks)
+
+
 def format_email_examples(examples: Sequence[Tuple[Path, str]]) -> str:
     if not examples:
         return "Nessun esempio email fornito."
@@ -561,28 +921,51 @@ def format_email_examples(examples: Sequence[Tuple[Path, str]]) -> str:
     return "\n\n".join(chunks)
 
 
-def build_email_user_prompt(
+def build_input_sections(
     transcript_text: str,
     transcript_path: Path,
     calendar_path: Optional[Path],
     calendar_context: str,
+    known_data_path: Optional[Path],
+    known_data_context: str,
+    web_research_context: str,
     examples: Sequence[Tuple[Path, str]],
     config: AppConfig,
+    extracted_facts: Optional[Dict[str, Any]] = None,
 ) -> str:
     calendar_label = calendar_path.name if calendar_path is not None else "non disponibile"
     calendar_text = calendar_context or "Nessun contesto Calendar trovato per questa trascrizione."
+    known_data_label = known_data_path.name if known_data_path is not None else "non disponibile"
+    known_data_text = known_data_context or "Nessun dato lead gia noto fornito."
+    web_research_text = web_research_context or "Nessuna ricerca web disponibile."
+    facts_text = (
+        json.dumps(extracted_facts, ensure_ascii=False, indent=2)
+        if extracted_facts is not None
+        else "Fase di estrazione non ancora eseguita."
+    )
 
     return "\n\n".join(
         [
-            "Devi generare la bozza email per questa call.",
+            "Genera il follow-up post-call usando questi input separati.",
             f"FILE TRASCRIZIONE: {transcript_path.name}",
             f"CONTESTO CALENDAR: {calendar_label}",
-            "=== CONTESTO CALENDAR ===",
+            f"DATI LEAD: {known_data_label}",
+            "[CALENDAR]",
             truncate_text(calendar_text, config.email_max_calendar_chars),
-            "=== TRASCRIZIONE CALL ===",
+            "[TRANSCRIPT]",
             truncate_text(transcript_text, config.email_max_transcript_chars),
-            "=== ESEMPI EMAIL DA IMITARE PER STILE E STRUTTURA ===",
+            "[KNOWN_DATA]",
+            truncate_text(known_data_text, config.email_max_calendar_chars),
+            "[WEB_RESEARCH]",
+            truncate_text(web_research_text, config.email_max_calendar_chars),
+            "[EXTRACTED_FACTS]",
+            facts_text,
+            "[EMAIL_EXAMPLES]",
             format_email_examples(examples),
+            "[SENDER]",
+            f"Nome mittente: {config.sender_name}",
+            f"Telefono mittente: {config.sender_phone or 'Non reperito'}",
+            f"Venditore di default se non emerge altro: {config.default_seller_name}",
         ]
     )
 
@@ -642,6 +1025,170 @@ def extract_source_vat_numbers(source_text: str) -> Set[str]:
         if len(digits) == 11:
             vat_numbers.add(digits)
     return vat_numbers
+
+
+def strip_html(raw_html: str) -> str:
+    without_scripts = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw_html)
+    without_tags = re.sub(r"(?s)<[^>]+>", " ", without_scripts)
+    return html.unescape(re.sub(r"\s+", " ", without_tags)).strip()
+
+
+def extract_urls(source_text: str) -> Set[str]:
+    return set(re.findall(r"https?://[^\s<>)\"']+", source_text, re.IGNORECASE))
+
+
+def domain_from_email(email_value: str) -> Optional[str]:
+    if "@" not in email_value:
+        return None
+    domain = email_value.rsplit("@", 1)[-1].strip().lower()
+    if not domain or domain in {"gmail.com", "outlook.com", "hotmail.com", "icloud.com", "yahoo.com"}:
+        return None
+    return domain
+
+
+def collect_candidate_domains(facts: Dict[str, Any], source_text: str) -> List[str]:
+    domains: List[str] = []
+    for email_value in extract_source_emails(source_text):
+        domain = domain_from_email(email_value)
+        if domain and domain not in domains:
+            domains.append(domain)
+
+    for url in extract_urls(source_text):
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        if domain and domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def fetch_text_url(url: str, timeout_seconds: float) -> Optional[str]:
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AxendFollowUpBot/1.0)"},
+            timeout=timeout_seconds,
+        )
+        if response.status_code >= 400:
+            return None
+        return strip_html(response.text)
+    except requests.RequestException:
+        return None
+
+
+def find_vat_candidates_with_sources(text: str, source_label: str) -> Dict[str, str]:
+    candidates: Dict[str, str] = {}
+    for match in re.finditer(r"\b(?:\d[\s.-]?){11}\b", text):
+        digits = normalize_digits(match.group(0))
+        if len(digits) == 11:
+            candidates.setdefault(digits, source_label)
+    return candidates
+
+
+def research_vat_from_company_site(domains: Sequence[str], config: AppConfig) -> Dict[str, str]:
+    paths = ["", "/", "/privacy", "/privacy-policy", "/contatti", "/contatto", "/contact", "/azienda"]
+    candidates: Dict[str, str] = {}
+    for domain in domains[:3]:
+        for path in paths:
+            url = f"https://{domain}{path}"
+            text = fetch_text_url(url, config.vat_research_timeout_seconds)
+            if not text and not path:
+                text = fetch_text_url(f"http://{domain}", config.vat_research_timeout_seconds)
+                url = f"http://{domain}"
+            if not text:
+                continue
+            page_candidates = find_vat_candidates_with_sources(text, f"sito aziendale {domain}")
+            candidates.update(page_candidates)
+            if len(candidates) > 1:
+                return candidates
+        if candidates:
+            return candidates
+    return candidates
+
+
+def research_vat_from_search(company_name: str, config: AppConfig) -> Dict[str, str]:
+    if not company_name or company_name in {"Non reperito", "Da verificare"}:
+        return {}
+    query = quote_plus(f"{company_name} partita iva")
+    search_url = f"https://duckduckgo.com/html/?q={query}"
+    text = fetch_text_url(search_url, config.vat_research_timeout_seconds)
+    if not text:
+        return {}
+    return find_vat_candidates_with_sources(text, "ricerca web DuckDuckGo")
+
+
+def build_web_research_context(facts: Dict[str, Any], source_text: str, config: AppConfig) -> Tuple[str, Dict[str, Any]]:
+    existing_vats = extract_source_vat_numbers(source_text)
+    if len(existing_vats) == 1:
+        vat_number = next(iter(existing_vats))
+        payload = {
+            "vat_status": "verified",
+            "vat_number": vat_number,
+            "vat_source": "Calendar/trascrizione/dati lead",
+            "notes": ["P.IVA presente in una fonte prioritaria."],
+        }
+        return format_web_research_context(payload), payload
+    if len(existing_vats) > 1:
+        payload = {
+            "vat_status": "conflict",
+            "vat_number": "Da verificare",
+            "vat_source": "Fonti prioritarie in conflitto",
+            "notes": [f"P.IVA candidate trovate: {', '.join(sorted(existing_vats))}"],
+        }
+        return format_web_research_context(payload), payload
+
+    if not config.vat_research_enabled:
+        payload = {
+            "vat_status": "not_found",
+            "vat_number": "Non reperito",
+            "vat_source": "Ricerca web disabilitata",
+            "notes": ["P.IVA non presente nelle fonti prioritarie."],
+        }
+        return format_web_research_context(payload), payload
+
+    candidates: Dict[str, str] = {}
+    domains = collect_candidate_domains(facts, source_text)
+    candidates.update(research_vat_from_company_site(domains, config))
+    if not candidates and config.vat_search_fallback_enabled:
+        candidates.update(research_vat_from_search(str(facts.get("company_name") or ""), config))
+
+    if len(candidates) == 1:
+        vat_number, vat_source = next(iter(candidates.items()))
+        payload = {
+            "vat_status": "verified",
+            "vat_number": vat_number,
+            "vat_source": vat_source,
+            "notes": ["P.IVA recuperata da ricerca esterna."],
+        }
+    elif len(candidates) > 1:
+        payload = {
+            "vat_status": "conflict",
+            "vat_number": "Da verificare",
+            "vat_source": "Ricerca esterna in conflitto",
+            "notes": [f"P.IVA candidate trovate: {', '.join(sorted(candidates))}"],
+        }
+    else:
+        payload = {
+            "vat_status": "not_found",
+            "vat_number": "Non reperito",
+            "vat_source": "Non reperito",
+            "notes": ["P.IVA non recuperata da fonti prioritarie o ricerca esterna."],
+        }
+    return format_web_research_context(payload), payload
+
+
+def format_web_research_context(payload: Dict[str, Any]) -> str:
+    notes = payload.get("notes") or []
+    return "\n".join(
+        [
+            f"vat_status: {payload.get('vat_status', 'not_found')}",
+            f"vat_number: {payload.get('vat_number', 'Non reperito')}",
+            f"vat_source: {payload.get('vat_source', 'Non reperito')}",
+            "notes:",
+            *[f"- {note}" for note in notes],
+        ]
+    )
 
 
 def source_contains_digit_value(value: Any, source_text: str, min_digits: int = 6) -> bool:
@@ -717,15 +1264,204 @@ def normalize_email_draft(raw_text: str) -> Dict[str, Any]:
     }
 
 
-def generate_sales_email_draft(
+FACT_DEFAULTS: Dict[str, Any] = {
+    "company_name": "Non reperito",
+    "seller_name": "Non reperito",
+    "contact_name": "Non reperito",
+    "contact_first_name": "Non reperito",
+    "phone": "Non reperito",
+    "email": "Non reperito",
+    "vat_number": "Non reperito",
+    "vat_source": "Non reperito",
+    "proposed_services": [],
+    "close_confidence": "Non reperito",
+    "close_date": "Non reperito",
+    "next_meeting_date": "Non reperito",
+    "next_meeting_text": "Non reperito",
+    "needs": [],
+    "current_issues": [],
+    "goals": [],
+    "current_situation": "Non reperito",
+    "decision_makers": [],
+    "attachments_to_send": [],
+    "missing_or_to_verify": [],
+}
+
+
+def normalize_fact_value(value: Any) -> str:
+    clean_value = str(value or "").strip()
+    if not clean_value or clean_value.lower() in {"none", "null", "n/a"}:
+        return "Non reperito"
+    return clean_value
+
+
+def normalize_facts(raw_facts: Dict[str, Any], config: AppConfig) -> Dict[str, Any]:
+    facts: Dict[str, Any] = {}
+    for key, default in FACT_DEFAULTS.items():
+        value = raw_facts.get(key, default)
+        if isinstance(default, list):
+            facts[key] = coerce_string_list(value)
+        else:
+            facts[key] = normalize_fact_value(value)
+
+    if facts["seller_name"] == "Non reperito" and config.default_seller_name:
+        facts["seller_name"] = config.default_seller_name
+    if facts["contact_first_name"] in {"Non reperito", "Da verificare"} and facts["contact_name"] not in {
+        "Non reperito",
+        "Da verificare",
+    }:
+        facts["contact_first_name"] = facts["contact_name"].split()[0]
+    return facts
+
+
+def infer_services_from_text(facts: Dict[str, Any], source_text: str) -> Dict[str, Any]:
+    services = coerce_string_list(facts.get("proposed_services"))
+    service_keys = {service.lower() for service in services}
+    lower_source = source_text.lower()
+
+    if "analisi" in lower_source and not any("analisi" in service for service in service_keys):
+        services.append("Analisi Basic")
+    telesetting_terms = ("telesetting", "commerciale", "chiamate", "appuntamenti", "prenotare")
+    if any(term in lower_source for term in telesetting_terms) and not any(
+        "telesetting" in service for service in service_keys
+    ):
+        services.append("Telesetting Advanced")
+
+    facts["proposed_services"] = services
+    return facts
+
+
+def enforce_source_backed_fact_dates(facts: Dict[str, Any], source_text: str) -> Dict[str, Any]:
+    for key in ("next_meeting_date", "close_date"):
+        value = str(facts.get(key) or "")
+        if value in {"Non reperito", "Da verificare"}:
+            continue
+        years = re.findall(r"\b(?:19|20)\d{2}\b", value)
+        if years and not all(year in source_text for year in years):
+            facts[key] = "Da verificare"
+            missing = coerce_string_list(facts.get("missing_or_to_verify"))
+            label = "Data prossimo incontro" if key == "next_meeting_date" else "Data di chiusura"
+            if label not in missing:
+                missing.append(label)
+            facts["missing_or_to_verify"] = missing
+    return facts
+
+
+def enforce_source_backed_contact_facts(facts: Dict[str, Any], source_text: str) -> Dict[str, Any]:
+    missing = coerce_string_list(facts.get("missing_or_to_verify"))
+    source_emails = extract_source_emails(source_text)
+    email = str(facts.get("email") or "").strip().lower()
+    if email and email not in {"non reperito", "da verificare"} and email not in source_emails:
+        facts["email"] = "Non reperito"
+        if "Email referente" not in missing:
+            missing.append("Email referente")
+    elif email in {"", "non reperito"} and len(source_emails) == 1:
+        facts["email"] = next(iter(source_emails))
+
+    phone = str(facts.get("phone") or "").strip()
+    if phone and phone not in {"Non reperito", "Da verificare"} and not source_contains_digit_value(phone, source_text):
+        facts["phone"] = "Non reperito"
+        if "Telefono referente" not in missing:
+            missing.append("Telefono referente")
+
+    vat_number = normalize_digits(facts.get("vat_number"))
+    source_vats = extract_source_vat_numbers(source_text)
+    if vat_number and facts.get("vat_number") not in {"Non reperito", "Da verificare"} and vat_number not in source_vats:
+        facts["vat_number"] = "Non reperito"
+        facts["vat_source"] = "Non reperito"
+        if "Partita IVA" not in missing:
+            missing.append("Partita IVA")
+
+    facts["missing_or_to_verify"] = missing
+    return facts
+
+
+def apply_verified_vat(facts: Dict[str, Any], vat_payload: Dict[str, Any]) -> Dict[str, Any]:
+    vat_status = str(vat_payload.get("vat_status") or "not_found")
+    if vat_status == "verified":
+        facts["vat_number"] = normalize_fact_value(vat_payload.get("vat_number"))
+        facts["vat_source"] = normalize_fact_value(vat_payload.get("vat_source"))
+    elif vat_status == "conflict":
+        facts["vat_number"] = "Da verificare"
+        facts["vat_source"] = normalize_fact_value(vat_payload.get("vat_source"))
+    elif facts.get("vat_number") not in {"Non reperito", "Da verificare"}:
+        facts["vat_source"] = facts.get("vat_source") or "Da verificare"
+    else:
+        facts["vat_number"] = "Non reperito"
+        facts["vat_source"] = "Non reperito"
+
+    missing = coerce_string_list(facts.get("missing_or_to_verify"))
+    if facts["vat_number"] in {"Non reperito", "Da verificare"} and "Partita IVA" not in missing:
+        missing.append("Partita IVA")
+    facts["missing_or_to_verify"] = missing
+    return facts
+
+
+def generate_call_facts(
     transcript_text: str,
     transcript_path: Path,
     calendar_path: Optional[Path],
     calendar_context: str,
+    known_data_path: Optional[Path],
+    known_data_context: str,
     examples: Sequence[Tuple[Path, str]],
     config: AppConfig,
 ) -> Dict[str, Any]:
-    logging.info("Generating sales email draft with OpenAI model %s", config.email_model)
+    logging.info("Extracting sales call facts with OpenAI model %s", config.email_model)
+    client = OpenAI(api_key=config.openai_api_key)
+    response = client.responses.create(
+        model=config.email_model,
+        input=[
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": FACT_EXTRACTION_SYSTEM_PROMPT}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": build_input_sections(
+                            transcript_text=transcript_text,
+                            transcript_path=transcript_path,
+                            calendar_path=calendar_path,
+                            calendar_context=calendar_context,
+                            known_data_path=known_data_path,
+                            known_data_context=known_data_context,
+                            web_research_context="",
+                            examples=examples,
+                            config=config,
+                        ),
+                    }
+                ],
+            },
+        ],
+        temperature=0,
+        max_output_tokens=config.email_max_output_tokens,
+    )
+    facts_text = extract_openai_text(response)
+    if not facts_text:
+        raise RuntimeError("OpenAI returned empty call facts")
+    try:
+        raw_facts = parse_json_object(facts_text)
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI returned invalid facts JSON: {facts_text[:500]}") from exc
+    return normalize_facts(raw_facts, config)
+
+
+def generate_final_email_output(
+    transcript_text: str,
+    transcript_path: Path,
+    calendar_path: Optional[Path],
+    calendar_context: str,
+    known_data_path: Optional[Path],
+    known_data_context: str,
+    web_research_context: str,
+    examples: Sequence[Tuple[Path, str]],
+    facts: Dict[str, Any],
+    config: AppConfig,
+) -> str:
+    logging.info("Generating final sales email output with OpenAI model %s", config.email_model)
     client = OpenAI(api_key=config.openai_api_key)
     response = client.responses.create(
         model=config.email_model,
@@ -739,13 +1475,17 @@ def generate_sales_email_draft(
                 "content": [
                     {
                         "type": "input_text",
-                        "text": build_email_user_prompt(
+                        "text": build_input_sections(
                             transcript_text=transcript_text,
                             transcript_path=transcript_path,
                             calendar_path=calendar_path,
                             calendar_context=calendar_context,
+                            known_data_path=known_data_path,
+                            known_data_context=known_data_context,
+                            web_research_context=web_research_context,
                             examples=examples,
                             config=config,
+                            extracted_facts=facts,
                         ),
                     }
                 ],
@@ -754,57 +1494,262 @@ def generate_sales_email_draft(
         temperature=0.2,
         max_output_tokens=config.email_max_output_tokens,
     )
+    final_output = extract_openai_text(response)
+    if not final_output:
+        raise RuntimeError("OpenAI returned an empty email output")
+    return final_output.strip() + "\n"
 
-    draft_text = extract_openai_text(response)
-    if not draft_text:
-        raise RuntimeError("OpenAI returned an empty email draft")
 
-    draft = normalize_email_draft(draft_text)
-    enforce_source_backed_crm_fields(draft, "\n\n".join([transcript_text, calendar_context]))
+def format_services_for_output(services: Sequence[str]) -> str:
+    clean_services = [service for service in services if service]
+    if not clean_services:
+        return "* Non reperito"
+    return "\n".join(f"* {service}" for service in clean_services)
+
+
+def piva_source_line(facts: Dict[str, Any], vat_payload: Dict[str, Any]) -> str:
+    if str(vat_payload.get("vat_status") or "") != "verified":
+        return ""
+    source = normalize_fact_value(facts.get("vat_source"))
+    if source in {"Non reperito", "Da verificare"}:
+        return ""
+    company = normalize_fact_value(facts.get("company_name"))
+    return f"\nFonte P.IVA {company}: {source}\n"
+
+
+def extract_body_from_model_output(output: str) -> str:
+    stripped = output.strip()
+    if "Note in mail:" in stripped:
+        candidate = stripped.split("Note in mail:", 1)[1].strip()
+        if "______________" in candidate:
+            candidate = candidate.split("______________", 1)[1].strip()
+        if not candidate.startswith("Gentile ") and "Gentile " in candidate:
+            candidate = candidate[candidate.rfind("Gentile ") :].strip()
+        return candidate
+    if "______________" in stripped:
+        after_separator = stripped.split("______________", 1)[1].strip()
+        gentile_index = after_separator.find("Gentile ")
+        if gentile_index >= 0:
+            return after_separator[gentile_index:].strip()
+    return stripped
+
+
+def has_reliable_next_meeting(facts: Dict[str, Any]) -> bool:
+    meeting_date = normalize_fact_value(facts.get("next_meeting_date"))
+    meeting_text = normalize_fact_value(facts.get("next_meeting_text"))
+    combined = f"{meeting_date} {meeting_text}".lower()
+    if "da verificare" in combined or "non reperito" in combined:
+        return False
+    return bool(re.search(r"\d", combined)) and any(
+        month in combined
+        for month in (
+            "gennaio",
+            "febbraio",
+            "marzo",
+            "aprile",
+            "maggio",
+            "giugno",
+            "luglio",
+            "agosto",
+            "settembre",
+            "ottobre",
+            "novembre",
+            "dicembre",
+            "/",
+            "-",
+        )
+    )
+
+
+def remove_unreliable_followup_paragraphs(body: str, facts: Dict[str, Any]) -> str:
+    if has_reliable_next_meeting(facts):
+        return body
+    paragraphs = re.split(r"\n\s*\n", body.strip())
+    risky_terms = (
+        "prossimo incontro",
+        "incontro fissato",
+        "incontro di aggiornamento",
+        "ci sentiremo",
+        "confermo il nostro incontro",
+        "confermo il prossimo",
+    )
+    kept = []
+    for paragraph in paragraphs:
+        lower_paragraph = paragraph.lower()
+        if any(term in lower_paragraph for term in risky_terms):
+            continue
+        kept.append(paragraph)
+    return "\n\n".join(kept).strip()
+
+
+def ensure_final_output_format(final_output: str, facts: Dict[str, Any], vat_payload: Dict[str, Any]) -> str:
+    stripped = final_output.strip()
+    company = normalize_fact_value(facts.get("company_name"))
+    seller = normalize_fact_value(facts.get("seller_name"))
+    contact = normalize_fact_value(facts.get("contact_name"))
+    phone = normalize_fact_value(facts.get("phone"))
+    email = normalize_fact_value(facts.get("email"))
+    vat_number = normalize_fact_value(facts.get("vat_number"))
+    confidence = normalize_fact_value(facts.get("close_confidence"))
+    close_date = normalize_fact_value(facts.get("close_date"))
+    services = format_services_for_output(coerce_string_list(facts.get("proposed_services")))
+
+    body = extract_body_from_model_output(stripped)
+    body = remove_unreliable_followup_paragraphs(body, facts)
+    if not body.startswith("Gentile "):
+        first_name = normalize_fact_value(facts.get("contact_first_name"))
+        if first_name in {"Non reperito", "Da verificare"}:
+            first_name = contact
+        body = f"Gentile {first_name},\n\n{body}"
+    if "Un cordiale saluto" not in body:
+        body = body.rstrip() + "\n\nUn cordiale saluto,\n\nFrancesca"
+
+    output = "\n".join(
+        [
+            company,
+            "",
+            f"Venditore: {seller}",
+            "",
+            f"Riferimento: {contact}",
+            "",
+            f"Tel: {phone}",
+            "",
+            f"Mail: {email}",
+            "",
+            f"Partita IVA: {vat_number}",
+            "",
+            "Servizi proposti:",
+            services,
+            "",
+            f"Confidenza di chiusura: {confidence}",
+            f"Data di chiusura: {close_date}",
+            "",
+            "______________",
+            "",
+            "Note in mail:",
+            "",
+            body.strip(),
+        ]
+    )
+    source_line = piva_source_line(facts, vat_payload)
+    if source_line:
+        output = output.rstrip() + source_line
+    return output.strip() + "\n"
+
+
+def generate_sales_email_draft(
+    transcript_text: str,
+    transcript_path: Path,
+    calendar_path: Optional[Path],
+    calendar_context: str,
+    known_data_path: Optional[Path],
+    known_data_context: str,
+    examples: Sequence[Tuple[Path, str]],
+    config: AppConfig,
+) -> Dict[str, Any]:
+    source_text = "\n\n".join([transcript_text, calendar_context, known_data_context])
+    facts = generate_call_facts(
+        transcript_text=transcript_text,
+        transcript_path=transcript_path,
+        calendar_path=calendar_path,
+        calendar_context=calendar_context,
+        known_data_path=known_data_path,
+        known_data_context=known_data_context,
+        examples=examples,
+        config=config,
+    )
+    facts = enforce_source_backed_contact_facts(facts, source_text)
+    facts = infer_services_from_text(facts, source_text)
+    facts = enforce_source_backed_fact_dates(facts, source_text)
+    web_research_context, vat_payload = build_web_research_context(facts, source_text, config)
+    facts = apply_verified_vat(facts, vat_payload)
+    final_output = generate_final_email_output(
+        transcript_text=transcript_text,
+        transcript_path=transcript_path,
+        calendar_path=calendar_path,
+        calendar_context=calendar_context,
+        known_data_path=known_data_path,
+        known_data_context=known_data_context,
+        web_research_context=web_research_context,
+        examples=examples,
+        facts=facts,
+        config=config,
+    )
+    final_output = ensure_final_output_format(final_output, facts, vat_payload)
+
+    draft = {
+        "final_output": final_output,
+        "facts": facts,
+        "web_research": vat_payload,
+        "source_notes": [
+            "Calendar Google o file locale usato se disponibile.",
+            "Trascrizione completa usata come fonte principale della call.",
+            "P.IVA verificata solo se presente nelle fonti o recuperata da ricerca esterna.",
+        ],
+        "missing_fields": coerce_string_list(facts.get("missing_or_to_verify")),
+    }
     draft["source_transcript_file"] = transcript_path.name
     draft["source_calendar_file"] = calendar_path.name if calendar_path is not None else None
+    draft["source_known_data_file"] = known_data_path.name if known_data_path is not None else None
     draft["examples_used"] = [path.name for path, _ in examples]
     return draft
 
 
-def format_email_draft_markdown(draft: Dict[str, Any]) -> str:
-    source_notes = coerce_string_list(draft.get("source_notes"))
-    missing_fields = coerce_string_list(draft.get("missing_fields"))
-
-    lines = [
-        "# Bozza email",
-        "",
-        f"**Oggetto:** {draft.get('subject', 'Follow-up alla nostra call')}",
-        "",
-        str(draft.get("body") or "").strip(),
-        "",
-        "---",
-        "",
-        "## Fonti e controlli",
+def sheet_row_from_draft(draft: Dict[str, Any], draft_path: Path, json_path: Path) -> List[str]:
+    facts = draft.get("facts") if isinstance(draft.get("facts"), dict) else {}
+    web_research = draft.get("web_research") if isinstance(draft.get("web_research"), dict) else {}
+    return [
+        datetime.now().astimezone().isoformat(timespec="seconds"),
+        str(draft.get("source_transcript_file") or ""),
+        str(facts.get("company_name") or "Non reperito"),
+        str(facts.get("seller_name") or "Non reperito"),
+        str(facts.get("contact_name") or "Non reperito"),
+        str(facts.get("phone") or "Non reperito"),
+        str(facts.get("email") or "Non reperito"),
+        str(facts.get("vat_number") or "Non reperito"),
+        str(web_research.get("vat_status") or "not_found"),
+        str(facts.get("vat_source") or "Non reperito"),
+        "\n".join(coerce_string_list(facts.get("proposed_services"))),
+        str(facts.get("close_confidence") or "Non reperito"),
+        str(facts.get("close_date") or "Non reperito"),
+        str(facts.get("next_meeting_date") or "Non reperito"),
+        str(facts.get("next_meeting_text") or "Non reperito"),
+        "\n".join(coerce_string_list(facts.get("current_issues"))),
+        "\n".join(coerce_string_list(facts.get("goals"))),
+        "\n".join(coerce_string_list(facts.get("missing_or_to_verify"))),
+        str(draft_path),
+        str(json_path),
+        str(draft.get("final_output") or ""),
     ]
 
-    if source_notes:
-        lines.extend(f"- {note}" for note in source_notes)
-    else:
-        lines.append("- Nessuna nota fonte restituita dal modello.")
 
-    lines.extend(
-        [
-            "",
-            f"- Trascrizione: {draft.get('source_transcript_file')}",
-            f"- Calendar: {draft.get('source_calendar_file') or 'non disponibile'}",
-            f"- Esempi email: {', '.join(draft.get('examples_used') or []) or 'non disponibili'}",
-            "",
-            "## Campi mancanti",
-        ]
+def append_draft_to_google_sheet(draft: Dict[str, Any], draft_path: Path, json_path: Path, config: AppConfig) -> None:
+    if not config.google_sheets_enabled:
+        return
+    if not config.google_sheet_id:
+        logging.warning("GOOGLE_SHEETS_ENABLED=true but GOOGLE_SHEET_ID is empty")
+        return
+
+    service = build_google_service(
+        config,
+        "sheets",
+        "v4",
+        ["https://www.googleapis.com/auth/spreadsheets"],
     )
-
-    if missing_fields:
-        lines.extend(f"- {field}" for field in missing_fields)
-    else:
-        lines.append("- Nessuno")
-
-    return "\n".join(lines).strip() + "\n"
+    body = {"values": [sheet_row_from_draft(draft, draft_path, json_path)]}
+    (
+        service.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=config.google_sheet_id,
+            range=config.google_sheet_range,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        )
+        .execute()
+    )
+    logging.info("Appended email draft to Google Sheet range %s", config.google_sheet_range)
 
 
 def save_email_outputs(
@@ -814,13 +1759,23 @@ def save_email_outputs(
 ) -> Tuple[Path, Path]:
     config.email_drafts_dir.mkdir(parents=True, exist_ok=True)
     safe_title = sanitize_filename(title)
-    draft_path = unique_path(config.email_drafts_dir, f"{safe_title}_email", ".md")
-    json_path = draft_path.with_suffix(".json")
+    stem = f"{safe_title}_email"
+    draft_path = config.email_drafts_dir / f"{stem}.txt"
+    json_path = config.email_drafts_dir / f"{stem}.json"
+    counter = 2
+    while draft_path.exists() or json_path.exists():
+        draft_path = config.email_drafts_dir / f"{stem}_{counter}.txt"
+        json_path = config.email_drafts_dir / f"{stem}_{counter}.json"
+        counter += 1
 
-    draft_path.write_text(format_email_draft_markdown(draft), encoding="utf-8")
+    draft_path.write_text(str(draft.get("final_output") or "").strip() + "\n", encoding="utf-8")
     json_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        append_draft_to_google_sheet(draft, draft_path, json_path, config)
+    except Exception:
+        logging.exception("Failed to append email draft to Google Sheet")
     logging.info("Saved email draft: %s", draft_path)
-    logging.info("Saved CRM payload draft: %s", json_path)
+    logging.info("Saved structured payload draft: %s", json_path)
     return draft_path, json_path
 
 
@@ -830,19 +1785,24 @@ def generate_and_save_email_draft(
     title: str,
     config: AppConfig,
     extra_calendar_lookup_stems: Sequence[str] = (),
+    audio_path: Optional[Path] = None,
     force: bool = False,
 ) -> Optional[Tuple[Path, Path]]:
     if not config.email_drafts_enabled and not force:
         return None
 
     lookup_stems = [transcript_path.stem, title, *extra_calendar_lookup_stems]
-    calendar_path, calendar_context = find_calendar_context(config, lookup_stems)
+    reference_time = get_reference_time(audio_path, transcript_path)
+    calendar_path, calendar_context = build_calendar_context(config, lookup_stems, reference_time)
+    known_data_path, known_data_context = find_known_data_context(config, lookup_stems)
     examples = load_email_examples(config)
     draft = generate_sales_email_draft(
         transcript_text=transcript_text,
         transcript_path=transcript_path,
         calendar_path=calendar_path,
         calendar_context=calendar_context,
+        known_data_path=known_data_path,
+        known_data_context=known_data_context,
         examples=examples,
         config=config,
     )
@@ -891,6 +1851,7 @@ def process_audio_file(audio_path: Path, config: AppConfig) -> None:
             title=title,
             config=config,
             extra_calendar_lookup_stems=(audio_path.stem,),
+            audio_path=audio_path,
         )
     except Exception:
         logging.exception("Failed to generate email draft for %s", transcript_path)

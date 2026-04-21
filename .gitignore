@@ -11,3 +11,7 @@ Archivio/
 BozzeEmail/
 EsempiEmail/
 EventiCalendar/
+DatiLead/
+google_oauth_client_secret.json
+google_oauth_token.json
+*.token.json
