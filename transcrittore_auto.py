@@ -25,6 +25,8 @@ from watchdog.observers import Observer
 
 
 ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 TITLE_SYSTEM_PROMPT = (
     "Sei un assistente. Leggi questa trascrizione di una call di vendita. "
     "Trova il nome del potenziale cliente (se menzionato) e il prodotto/servizio "
@@ -714,6 +716,10 @@ def format_rfc3339(value: datetime) -> str:
     return value.astimezone().isoformat()
 
 
+def unique_scopes(scopes: Iterable[str]) -> List[str]:
+    return list(dict.fromkeys(scope for scope in scopes if scope))
+
+
 def get_google_credentials(config: AppConfig, scopes: Sequence[str]) -> Any:
     try:
         from google.auth.transport.requests import Request
@@ -722,10 +728,18 @@ def get_google_credentials(config: AppConfig, scopes: Sequence[str]) -> Any:
     except ImportError as exc:
         raise ConfigError("Install Google dependencies with pip install -r requirements.txt") from exc
 
+    requested_scopes = unique_scopes(scopes)
+    saved_scopes: List[str] = []
     creds = None
     if config.google_oauth_token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(config.google_oauth_token_path), list(scopes))
-        if creds and hasattr(creds, "has_scopes") and not creds.has_scopes(list(scopes)):
+        try:
+            token_data = json.loads(config.google_oauth_token_path.read_text(encoding="utf-8"))
+            saved_scopes = unique_scopes(token_data.get("scopes") or [])
+        except (OSError, json.JSONDecodeError):
+            saved_scopes = []
+        effective_scopes = unique_scopes([*saved_scopes, *requested_scopes])
+        creds = Credentials.from_authorized_user_file(str(config.google_oauth_token_path), effective_scopes)
+        if saved_scopes and not set(requested_scopes).issubset(set(saved_scopes)):
             creds = None
 
     if creds and creds.expired and creds.refresh_token:
@@ -736,7 +750,7 @@ def get_google_credentials(config: AppConfig, scopes: Sequence[str]) -> Any:
             raise ConfigError("Missing GOOGLE_OAUTH_CLIENT_SECRETS for Google OAuth")
         flow = InstalledAppFlow.from_client_secrets_file(
             str(config.google_oauth_client_secrets_path),
-            list(scopes),
+            unique_scopes([*saved_scopes, *requested_scopes]),
         )
         creds = flow.run_local_server(port=config.google_oauth_local_port)
 
@@ -839,7 +853,7 @@ def fetch_google_calendar_context(config: AppConfig, reference_time: datetime) -
         config,
         "calendar",
         "v3",
-        ["https://www.googleapis.com/auth/calendar.readonly"],
+        [GOOGLE_CALENDAR_SCOPE],
     )
     time_min = reference_time - timedelta(minutes=config.google_calendar_lookup_before_minutes)
     time_max = reference_time + timedelta(minutes=config.google_calendar_lookup_after_minutes)
@@ -1743,7 +1757,7 @@ def append_draft_to_google_sheet(draft: Dict[str, Any], draft_path: Path, json_p
         config,
         "sheets",
         "v4",
-        ["https://www.googleapis.com/auth/spreadsheets"],
+        [GOOGLE_SHEETS_SCOPE],
     )
     body = {"values": [sheet_row_from_draft(draft, draft_path, json_path)]}
     (
